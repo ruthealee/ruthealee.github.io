@@ -1,0 +1,102 @@
+---
+layout: post 
+title: "System Calls and the vDSO" 
+date: 2017-04-03
+categories: [kernel]
+---
+
+So, the vDSO is neat. A while back I was sent a link to the Package Cloud blog where they discuss the gettimeofday and clock_gettime calls being slow on AWS EC2 since they can't use the vDSO because Xen doesn't support readint the time in userland via the vDSO. I read that and it was interesting, but I also realised I didn't actually know what the vDSO was. 
+
+### Off to see a man about a vDSO
+
+The man page for the vDSO is actually really good. From that "The vDSO (virtual dynamic shared object) is a small shared library that the kernel automatically maps into the address space of all user-space applications."[1]
+
+It exists to help reduce the overhead that the kernel normally has to handle for system calls that are invoked frequently by user applications. So, a common example given is gettimeofday(), which will often be used as part of timer functionality in programs. 
+
+The vDSO will essentially allow that system call to be initiated and completed entirely in userspace. These aren't just any system calls but specific ones that are built into the vDSO.
+
+Pretty cool. Probably should have stopped there and continued to live my life happily. Of course I didn't. What the man page doesn't really go into is how this works, and it requires a bit of reading around how system calls work generally and therefore how a syscall utilising the vDSO differs from these. Also, as with most interesting things in Linux, a little bit (a lot) of memory management. 
+
+### What's a system call?
+A system call is used, generally speaking, to ask the kernel to execute an instruction at a higher privilege level on the CPU than a user space program possesses. Most of the time when your program needs to make a system call its request will utilise a shared library like libc, which is essentially just a wrapper that arranges the arguments you've passed and deals with handing this over to the kernel. This prevents you from having to know about assembly and registers. 
+
+
+You could do this manually yourself with a little bit of assembly and a deep interest in registers but why bother when libc does it for you. The package cloud blog actually has a super cool write up of how to do this that was neat to run through [2]. Okay, so we know that system calls are essentially just values inserted into the right registers that let the CPU know what code to execute and what values to pass to it. 
+
+### What happens when I make a system call?
+Assuming you've requested the call (either by writing assembly yourself like a boss, or letting libc do it for you) this is going to initiate a change from user space to kernel space, a context switch. This happens because the code that is used in a system call requires privilege to access. It lives in a place in RAM that's categorised as system space. The reason for having privilege levels is pretty obvious, but it's fundamentally protecting the CPU from us, the idiot user. Anyway, context switches are costly, or at least that's what my senior techs are always telling me. 
+
+A bit of digging into how system calls actually work reveals why this is. When switching from user space to kernel space the kernel is required to do some book keeping. When a userland process initiates a system call and the thread enters the kernel a set of values including the instruction pointer (where were you executing last) as well as CPU flags etc. are saved from the program stack onto the kernel stack. Once the call executes on the CPU and a value is returned the kernel is going to have to pop all those values back off it's own stack into the program stack along with whatever the system call returned and then hand that all back off to the user process.  
+
+There's some variation in exactly how this is achieved dependent on whether you're using 32bit, 64bit systems as well as how it implements saving the information onto the program stack but that seems to be a rough overview of what is going on. Think of the process essentially just chucking all it's possessions at the kernel and shouting 'hey hold my stuff' while it executes whatever it needs to and expecting the kernel to dutifully hand it all back at the end. 
+
+### What does memory mapping have to do with this?
+So, the way the privilege levels operate between system and user processes is actually not to do with anything inherently privileged within the code. Instead it's a combination of the kernel and MMU working in conjunction to protect access to physical memory addresses. 
+
+Sidebar: Virtual memory refresher. All memory requests from your system (including kernel and user space) use virtual addresses. 
+The kernel will check that a process is making a valid request for memory access (It's accessing a virtual address contained within it's process space). The virtual address space means that we can do cool stuff like isolate system memory from process memory, and isolate processes from one another. Also swap and other magic tricks. Other cool things you can do are share pages between processes within user space, this is where you have two virtual addresses that map to the same physical frame. This is utilised quite a bit to share pages between applications. The vDSO does something similar, except it has to manage some additional worries, because it's mapping a virtual address to a physical address within the range preserved for priviliged code. This means it has to take some additional security related considerations into account. 
+
+Memory mapping is provided by the MMU (the literal physical MMU that's on the CPU), or in a case where you don't have a physical MMU (i.e. non x86 architecture). The MMU divides up the physical addresses into little sections, in the interests of brevity here let's just assume they are 'system code' and 'user space code' (there's other spaces but not relevant here). When your process initiates memory gets allocated to it (with malloc or whatever). If it wants to access something in its memory space it asks the kernel which will check that it's requesting access to a virtual memory address that's within it's allocated region. If it is, it passes the request along and the MMU will look up some tables (holla @ your boy the TLB!) and that code will execute. If it's not in its region the kernel will be angry at the process. 
+
+Okay, so lets say we need a system call, that's code that's flagged as 'system' code, or ring0 privileged. Say, the time or to read a file. Our process can't request that it execute it in user space, so it asks the kernel to execute it and to return the value (syscall). The kernel makes sure that the process should be able to request that (e.g. apache asks to read a file that it has read permissions on, or it's asking for something) and then requests that be executed. The MMU's job is to ensure that the request there is coming from a virtual memory range that's marked as privileged (ring0). Basically it's doing the same thing the kernel is for processes, checking that the permissions to access that physical page frame are correct. In this way you have segmentation of both system and process memory in the MMU, as well as the kernel managing that processes stay within their own memory space. Thus providing security layers protecting the system memory locations as well as walling off the process memory locations from other processes in user space.  
+
+When a request to execute something hits the kernel, it will check that the request is valid and ask the MMU to translate the address. The MMU, will if it's happy that everything is in order, do so and it will map the virtual location to the physical location . The CPU will then look at the flags passed along to it by the kernel and execute the code it finds there.
+
+So at a really fundamental level two things technically prevent a user space program from executing a system call. The kernel itself as intermediary, and the MMU that's mediating the relationship between virtual and physical memory mappings. In this case your MMU functionality (whether provided by hardware or by the kernel) is gatekeeping the execution of privileged code (particularly that in the mappings that's flagged for the system)  by obscuring it's location. You can't execute it if you can't find it, and you can't find it if you don't have access to the mapping tables. The kernel will prevent any attempts to access physical RAM addresses anyway, but all requests for memory will go through some kind of virtual/physical mapping so you have a kind of dual check layer here preventing us from getting the system call code executed. 
+
+There's a tertiary need for the CPU to switch between privilege levels in a predefined way which is implemented with gates to give some additional security around this, but that's a pretty large detour, more details in the source list at the end. [7]
+
+### Putting it all together
+This does let us do some neat stuff now, because we know that system calls require overhead since we've thought about all the things that need to happen to execute a system call: Your program is going to make a call, usually by getting that wrappered up neatly by a shared library like libc, that's going to go initiate a context switch, the kernel will then take some information about your process including checking privilege and saving what point it was executing at when it requested the switch. The MMU at that point is going to have a look at the request to execute some code at a virtual address, check that the kernel has the privilege level required to request that (it better!), map that virtual address to a physical address, load the code at that address, execute it, output that back to the appropriate register where the kernel will pick it back up, put it into your programs stack and send the control back over to userspace and your program probably via libc again, making sure to pass back that return pointer that lets you know where to pick up execution of your program. That's a lot of work!
+
+### Work smarter not harder
+How can we avoid this? Well the simple answer is 'avoid syscalls', but they're kind of useful so beyond attempting to minimise them by writing intelligent code what kind of performance improvement can be made? 
+
+The vDSO is an attempt to solve this. It does this by giving us essentially a back door into those protected memory sections. We want to keep the ring fencing between system and user land, and also between processes but we also want each process to be able to access _some_ kernel variables without having to jump through a bunch of hoops. 
+
+The vDSO gets appended on to every single userland process when the process is initiated. It's really just a memory region inside the address space of each process. You can already see here we're trying to respect the idea of keeping processes contained within their pre-allocated memory regions. That's why it's mapped into every processes memory at initiation. The location it's mapped to is randomised (security! obscurity! Also what makes it better than vsyscall not to be confused with the variables we discuss in the next paragraph. but that's another detour)[8], if you wanted to find it you could have a look at the mapping for a process:
+
+```
+[root@athena ~]# cat /proc/1758/maps | grep vdso
+7ffee4de6000-7ffee4de7000 r-xp 00000000 00:00 0                          [vdso]
+```
+You can actually dump this out of memory with gdb to a file, and then read it with readelf which is super cool, there's a neat talk through of this on lwn.net[3]. 
+
+Anyway, if you wanted to then use this 'virtual' system call, what is happening under the hood is that this virtual system call, say \__vds__gettimeofday(), fetches kernel data from a variable called vsyscall_gtod_data. The code for these variables is in the vDSO but the data they are calling is not. There are two addresses at which this is located, the regular kernel-space address and another address contained within a region of memory referred to as the "vvar page"[4]. This page is made available read-only to user-space code. Yanking the comments out from the top of it we can see:
+
+```
+  6  * A handful of variables are accessible (read-only) from userspace
+  7  * code in the vsyscall page and the vdso.  They are declared here.
+  8  * Some other file must define them with DEFINE_VVAR.
+  9  *
+ 10  * In normal kernel code, they are used like any other variable.
+ 11  * In user code, they are accessed through the VVAR macro.
+```
+
+So essentially you have two virtual memory locations, one in userspace provided by the vDSO, and one in kernel space. They both end up mapping to the same physical address but only one has the privilege level to actually execute rather than just read. So if I want to access that variable and write to it from within kernel space I access it from the kernel space address (remember, the kernel and MMU are gatekeepers here), if I want to access it from user land I can read the value from the vvar page. So what's setting those variables? Well they're set from other kernel variables that are not exposed to user-space. That's your security mechanism. Some kernel variables are used to populate the vvar pages and the vDSO is used to call those values through the vvar page.  You've retained the division between kernel/user space (in this case the space we are talking about here is really just assigned virtual memory spaces) but we've also allowed a page of user space to map over to a physical address that is technically part of system space. It's letting us peak behind the curtain, although we have to make sure there's data actually there to be read, which leads us into how that vvar file is populated. 
+
+Let's look at gettimeofday() as an example, because i'm obsessed with time and it's the one lwn talked about too. What you do, is basically add a little bit of additional linking into normal kernel operation. This gets initiated at boot under the hood so you can't just add this on the fly. So, the kernel is managing its timekeeping in kernel space. For gettimeofday() there's a specific variable that gets mapped into memory, and the kernel updates it as part of its regular timekeeping function.  It calls timekeeping\_update(), and that calls update\_vsyscall/update\_vsyscall_tz, those functions will then update the values. When you make a gettimeofday() call then, you hit the vDSO which provides a function, which reads from the vvar page that accesses, read only, the specific page frame of physical memory that the variable data is stored in. When the kernel modifies the value of one of its internal variables, the associated variable(s) in the vvar page mwill then also be updated. And that's how you expose kernel variables as read-only in userspace. This is detailed much better at the lwn article linked below[3]
+
+So the vDSO is cool because it lets us share a single frame across both system and user memory addresses. By using two different virtual addresses, one in system and one in user memory space, we can allow different access to the vvar page. Other kernel routines will update the data within there (think timer subsystems here that are consistently updating the time of day value). That means we can allow user processes to read the contents of that page while also allowing processes with ring0 privileges to update the same data. This is neat and saves the overhead of popping pointers in and off the kernel stack just to read the value of something like the timeofday value. 
+
+Why does any of this matter? Well if you're running an application on a kernel version that doesn't have a vDSO, or in which a system call you use frequently isn't included within the vDSO, then you're going to have problems. Cool sidebar, you can create your own calls in the vDSO but that starts to get into compiling your own kernel.[6] The problem the package cloud blog hit on was that the AWS instances they were using didn't have gettimeofday() available to be accessed via the vDSO and so their application ran up to 70% slower on AWS instances. 
+
+[1][http://man7.org/linux/man-pages/man7/vdso.7.html](http://man7.org/linux/man-pages/man7/vdso.7.html)
+
+[2][https://blog.packagecloud.io/eng/2016/04/05/the-definitive-guide-to-linux-system-calls/](https://blog.packagecloud.io/eng/2016/04/05/the-definitive-guide-to-linux-system-calls/)
+
+
+[3][https://lwn.net/Articles/615809/](https://lwn.net/Articles/615809/)
+
+[4][http://lxr.free-electrons.com/source/arch/x86/include/asm/vvar.h?v=3.14](http://lxr.free-electrons.com/source/arch/x86/include/asm/vvar.h?v=3.14)
+
+[5][http://www.linuxjournal.com/content/creating-vdso-colonels-other-chicken?page=0,1](http://www.linuxjournal.com/content/creating-vdso-colonels-other-chicken?page=0,1)
+
+[6][https://blog.packagecloud.io/eng/2017/03/08/system-calls-are-much-slower-on-ec2/](https://blog.packagecloud.io/eng/2017/03/08/system-calls-are-much-slower-on-ec2/)
+
+[7][http://duartes.org/gustavo/blog/post/cpu-rings-privilege-and-protection/](http://duartes.org/gustavo/blog/post/cpu-rings-privilege-and-protection/)
+
+[8] Turns out people have named variables in a nonsensical fashion, shocking I know. From the vDSO man page, "Note that the terminology can be confusing.  On x86 systems, the vDSO function used to determine the preferred method of making a system call is named "__kernel_vsyscall", but on x86_64, the term "vsyscall"
+also refers to an obsolete way to ask the kernel what time it is or what CPU the caller is on.
+
+[9] https://github.com/0xAX/linux-insides

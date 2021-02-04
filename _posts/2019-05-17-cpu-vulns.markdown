@@ -1,0 +1,50 @@
+---
+layout: post
+title: "CPUs Suck: The Misery of Microarchitecture Insecurity"
+date: 2019-05-17
+categories: [security]
+---
+# CPUs Suck
+
+This week the industry has 99 problems and they're all to do with CPU vulnerabilities! Check out this catchy named [cpu.fail](https://cpu.fail) landing page for the full gory details. 
+
+After this week's glut of whitepapers, and frankly panic, I've never been more pleased to have spent the time to painstakingly read and try to understand Drepper's [What Every Programmer Should Know About Memory](https://people.freebsd.org/~lstewart/articles/cpumemory.pdf) This is without doubt the best resource I've found for understanding CPU cache architecture. Did I understand the whole thing? No. But it got me closer than I've ever come before to understanding how cache functions on modern processors and boy has that been a handy thing to have even a flimsy grip on. 
+
+
+## Do CPUs *actually* suck?
+The short answer is no, they don't. The longer answer is that over the development of CPU architecture there have been a number of methods utilised to push us ever faster, and those methods haven't always been the most secure. These all kind of loop back to the same underlying issue which plagues operating systems and anything that utilises memory at all. How do you segregate memory regions securely from potentially malicious or unauthorised access, and how do you do this while also taking advantage of caches. 
+
+The assumption up to recently was that we could worry about segregating between applications and privilege levels at an architectural (OS) layer, and the actual CPU itself could do it's own thing. Unfortunately side channel attacks that read buffer and cache contents show that's not enough. 
+
+Caches by their nature operate best when they are allowed to warm. That's because our number one concern with a cache is that we keep the hit rate high. Having to frequently change the contents of, or even fully flush a cache pushes miss rates up and performance down. 
+
+
+## Zombieload
+Zombieload is probably the neatest of the recent vulnerabilities. From the [paper itself](https://zombieloadattack.com/zombieload.pdf):
+> ZombieLoad exploits that load instructions which have to be re-issued internally, may first transiently compute on stale values belonging to previous memory operations from either the current or a sibling hyperthread. 
+
+Right so that's an intense sentence. I highly recommend the whitepaper itself which I found very approachable (unusual for these kinds of exploits). What's happening here is really an interesting combination of a lot of different aspects. 
+
+- When a CPU executes an instruction set it may break that down into chunks of instructions that it executes out of order. It utilises something called the _memory order buffer_ to deal with keeping track of each of these chunks and then returning the whole batch of instructions as if it were one single instruction executed in order. 
+- Each of these chunks of instructions may require loading of memory in order to execute. There are additional buffers within the memory order buffer that handle these. One is the _load buffer_ and the other the _store buffer_. 
+- Upon each _load_ operation the load buffer will check if the page is mapped in the TLB, and if it is will then try and pull the contents of the page from the L1D cache. If it's not mapped in the TLB, or it is mapped but the corresponding page is not contained in the L1D cache it will run a page miss handler. 
+- This will cause the CPU to have to go and fetch the instruction from RAM or higher tier caches. All of this is done via the _line fill buffer_ which basically just is a buffer that reads in a bunch of memory from different locations and then passes it along to other registers and buffers. (For those familiar with Drepper we'll remember why we might want to have a buffer that reads in lines from memory. As in lines over words of memory, which relates back to access times and how RAM chips actually operate on an electrical level.) 
+- **Here's where we get our leak.** The _line flow buffer_ is per core. So it shares all the logical siblings of each core. 
+- In the case where a page that we are trying to access doesn't exist or we don't have permission to access that physical region of memory we end up with a fault. A fault here requires us to call out to some microcode to handle. As part of handling this fault the microcode will get ready to flush the line flow buffer of its contents. 
+- _However_ due to how this line buffer operates we must allow all instructions which were in flight to complete. This is due to how out or order execution logic is structured. 
+- To do this as quickly as possible the paper hypothesises that then the remaing entries in the _line fill buffer_ are optimistically matched. This is called by them a 'use-after-free' vulnerability. Essentially, some data from another thread was written there earlier and because they're a near match the load instruction assumes that's the data that matches its request and reads it in. This can't really be known precisely because the microcode and the line fill buffer code are proprietary. 
+- This optimistic matching is triggered by that microcode fault saying 'we need to flush this just grab what you can and get out'. 
+- Once that data comes back in our returned operation it goes into CPU caches and we use traditional side channel attacks to leak this back up to our architectural (OS) level. 
+
+This is scary because it means anything executing on the same core could essentially just be leaked if we force enough faults to occur. It's not quite as specific as meltdown where we could specify what we want to leak, it's more of a leak everything and analyse that to hope you get something useful. The paper goes into how to actually achieve this and it's worht noting that they do so successfully. 
+
+The main part of this that we should be worried about is really around the fact that there's no separation of privilege levels at the line fill buffer level. We don't distinguish between a load operation for a kernel level process or a user process and this explains why this can also end up being used to sample data not just on a local machine but across guest and host as well as guest to guest boundaries. 
+
+
+## Mitigation
+Sad news: It's damn hard to mitigate this. 
+Essentially the only true safety is to disable hyperthreading. In the long run what I think spectre/meltdown and these other vulnerabilities are showing us is two things:
+
+- We cannot assume that segregation of application and privilege levels is only of concern at an architectural level. Microarchitecture must also work to segregate processes from one another and from privileged code execution. 
+- Proprietary code at this level of microarchitecture is dangerous. There's an increasing need to opensource this kind of hardware level engineering. 
+

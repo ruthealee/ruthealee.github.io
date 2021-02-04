@@ -1,0 +1,50 @@
+---
+layout: post
+title: "Time After Time: NTP Ruins Everything"
+date: 2018-03-22
+categories: [time]
+---
+
+Recently bumped into an interesting issue that was tangentially related to my favourite topic in the world....time.
+
+For some reason, some servers were seeing significant clock skew and time drift. After investigating this it became clear that this was only on certain instances
+with a very specific set of conditions:
+
+- They were on Ubuntu 16.04
+- They had encrypted data volumes
+
+When trying to interact with the ntp daemon this would fail, for example:
+```
+ntpdate -q
+23 Feb 15:23:40 ntpdate[15754]: no servers can be used, exiting
+```
+
+First thing I checked here was that ntp was running, which it reported it was, and then to trial nc agains the pool servers on the right UDP port. Both those came back as fine, so that was a loose end. However, when using ps to examine running processes there was no sign of ntp. Running 'service ntp start' didn't
+throw errors, but also didn't spawn any ntp process.
+
+After trying a few things, it became apparent that the init script worked when it was moved to another location and called directly. Strange.
+Running it with -x showed drastically different outputs when calling it from /etc/init.d/ntp and /tmp/ntp, as if it were executing a whole different set of instructions. Eventually I dug up this handy link:
+https://www.turnkeylinux.org/blog/debugging-systemd-sysv-init-compat Which details that with systemd when you run a /etc/init.d/ntp start it doesn't just execute the init script, rather because of the inclusion of /lib/lsb/init-functions it redirects the script forcing it to be invoked by initd. That's where things get twisted.
+
+This behaviour explained why the output of the scripts changed based on the location they were run from, and this was further confirmed by testing that ntp would start correctly when invoked with:
+```
+_SYSTEMCTL_SKIP_REDIRECT=1 etc/init.d/ntp start
+```
+
+Initially I suspected this might be due to the way encryption interacted with certain calls. When the ntp package was updated, the problem went away. An examination of the changes to the init script showed a difference in how the lockfile was created. In the 'bad' version this called on /usr/bin/lockfile-create to generate the lockfile, whereas in the later 'good' version it just uses a regular redirect to write the file rather than rely on a dedicated lock and unlock functions.
+
+So what did this have to do with encryption? Actually nothing! Looking at logs I could see some weird logs from apparmour that looked oddly similar to selinux context errors on RedHat servers I'd admin'd in the past. So I looked at the changelog for the new ntp package and it turns out that there was an issue with the apparmour profile that denied access to a lock file, and hence we saw
+the fix released for ntp:
+https://launchpad.net/ubuntu/+source/ntp/1:4.2.8p4+dfsg-3ubuntu5.8
+ * Apparmor denies access to lock it shares with ntpdate to ensure no
+   issues due to concurrent access
+
+So why did I only see this on encrypted instances? Well they're built using a different AMI since they require certain package and kernel versions.  The AMI's are for *most* purposes the same, however, since they were created at slightly different points the underlying packages that they initialise with are subtly different. In this case, the version of ntp in the non-encrypted image was actually older, and was prior to the apparmour context issue being introduced. We just happened to have created an image that used the one very specific package version of ntp that had the problem.
+
+Lessons learned:
+
+- Despite what I'd like to think, the problem isn't always related to filesystem encryption mechanisms.
+- We should include updating 'stock' packages to the latest version as part of our bootstrap / post provisioning process. At the very least we should do an update all and utilise package locking for those applications we don't want updated. This will ensure that we aren't stuck using out of date packages on new builds.
+- NTP breaks a lot of stuff when it stops working (this wasn't a new one for me, a time obsessive).
+- Don't assume newer = better. If I'd read the change log for the later ntp package we would have seen that the bug it fixed was introduced one version earlier. I spent too long assuming 'oh the non-encrypted instances have an older version so it isn't an issue'. Don't forget that bugs are just as likely to be introduced as they are to be fixed.
+
